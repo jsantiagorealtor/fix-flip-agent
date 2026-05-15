@@ -1,1 +1,1122 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# config.py  —  Fix & Flip Agent · St. Lucie County, FL
+# All tunable parameters in one place. Edit here, nowhere else.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── SEARCH CRITERIA ───────────────────────────────────────────────────────────
+SEARCH = {
+    "cities":       ["Port St. Lucie", "Fort Pierce"],
+    "state":        "FL",
+    "county":       "St. Lucie",
+    # All St. Lucie County zip codes (PSL + Fort Pierce + unincorporated)
+    "zip_codes":    ["34983", "34984", "34986", "34952", "34982",
+                     "34950", "34987", "34988", "34990", "34994"],
+    "min_price":    190_000,
+    "max_price":    250_000,
+    "min_beds":     3,
+    "min_baths":    2.0,
+    "min_sqft":     1_540,
+    "property_type": "Single Family",   # Rentcast filter value
+    "stories":      1,                  # Applied as post-filter when data available
+    "max_dom":      90,                 # Ignore stale listings over 90 days
+    "exclude_hoa":  False,              # Set True to skip HOA properties if detectable
+}
+
+# ── ARV & DEAL MATH ───────────────────────────────────────────────────────────
+DEAL = {
+    # Conservative ARV estimate for PSL renovated 3/2 CBS (MLS-confirmed $/SF)
+    # Based on closed comps May 2026: Hutchins $167/SF, Carter $199/SF, Exmore $195/SF
+    "arv_per_sqft_conservative": 215,   # low end (use this for scoring)
+    "arv_per_sqft_optimistic":   235,   # high end
+
+    # Cap ARV SF at 2,000 — very large homes don't scale linearly in PSL
+    "arv_sqft_cap": 2_000,
+
+    # 70% rule: MAO = (ARV × 0.70) − Rehab
+    "arv_rule_pct": 0.70,
+
+    # Rehab estimates by year built (mid-range, CBS construction)
+    "rehab_estimate": {
+        "before_1990": 80_000,    # Pre-1990: full systems likely original
+        "1990_to_1999": 65_000,   # 1990s: polybutylene plumbing era, original HVAC
+        "2000_to_2009": 50_000,   # 2000s: better bones, still needs cosmetic + systems
+        "2010_plus":    38_000,   # 2010+: lighter scope usually
+    },
+
+    # Deal grading thresholds (net profit after all costs)
+    "grade_a_profit":  40_000,    # A-grade: send immediate alert
+    "grade_b_profit":  25_000,    # B-grade: include in daily digest
+    "grade_c_profit":  10_000,    # C-grade: include in daily digest
+    # Below grade_c_profit → D (skip or log only)
+
+    # Holding/transaction cost assumptions (on top of rehab)
+    "buy_closing_pct":  0.025,    # 2.5% of purchase price
+    "sell_closing_pct": 0.07,     # 7% of ARV (agent + title + taxes)
+    "hold_costs":       8_400,    # 6-month hold: taxes, insurance, utilities
+}
+
+# ── EMAIL SETTINGS ────────────────────────────────────────────────────────────
+EMAIL = {
+    "recipient":    "jsantiagorealtor@gmail.com",
+    "sender":       "alerts@fixflipagent.io",   # Must be a SendGrid-verified sender
+    "sender_name":  "Fix & Flip Agent — St. Lucie",
+    "subject_on":   "🏠 On-Market Fix & Flip Deals — St. Lucie County",
+    "subject_off":  "🔑 Off-Market Fix & Flip Leads — St. Lucie County",
+    "subject_both": "🏠 Daily Fix & Flip Deal Report — St. Lucie County, FL",
+}
+
+# ── PASLC SCRAPER SETTINGS ────────────────────────────────────────────────────
+PASLC = {
+    "base_url":         "https://www.paslc.gov",
+    "search_path":      "/RESearch.aspx",       # Adjust if site structure differs
+    "rate_limit_secs":  2.0,                    # Seconds between requests (be respectful)
+    "max_results":      200,                    # Max off-market leads per run
+    # Land use codes for single-family residential in FL CAMA systems
+    "sfr_land_use_codes": ["01", "001", "0100", "0101", "SFR", "RES"],
+    # PSL subdivisions/sections to target (high investor activity)
+    "target_sections": [
+        "PORT ST LUCIE SEC 28", "PORT ST LUCIE SEC 04",
+        "PORT ST LUCIE SEC 13", "PORT ST LUCIE SEC 17",
+        "PORT ST LUCIE SEC 21", "PORT ST LUCIE SEC 33",
+        "PORT ST LUCIE SEC 36", "PORT ST LUCIE SEC 40",
+    ],
+}
+
+# ── RENTCAST API SETTINGS ─────────────────────────────────────────────────────
+RENTCAST = {
+    "base_url":  "https://api.rentcast.io/v1",
+    "limit":     500,       # Max results per call
+    # Free tier = 50 calls/month. 2 cities × every-other-day = 30 calls/mo ✓
+    # Upgrade to $29/mo paid tier for true daily alerts.
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# deal_scorer.py  —  70% Rule calculator + deal grader
+# ─────────────────────────────────────────────────────────────────────────────
+from config import DEAL
+
+
+def estimate_arv(sqft: int) -> dict:
+    """Estimate ARV using $/SF benchmarks from closed PSL comps (May 2026)."""
+    capped_sqft = min(sqft, DEAL["arv_sqft_cap"])
+    return {
+        "conservative": round(capped_sqft * DEAL["arv_per_sqft_conservative"]),
+        "optimistic":   round(capped_sqft * DEAL["arv_per_sqft_optimistic"]),
+    }
+
+
+def estimate_rehab(year_built: int) -> int:
+    """Return mid-range rehab estimate based on home age."""
+    if not year_built or year_built == 0:
+        return DEAL["rehab_estimate"]["1990_to_1999"]  # default to middle bucket
+    if year_built < 1990:
+        return DEAL["rehab_estimate"]["before_1990"]
+    elif year_built < 2000:
+        return DEAL["rehab_estimate"]["1990_to_1999"]
+    elif year_built < 2010:
+        return DEAL["rehab_estimate"]["2000_to_2009"]
+    else:
+        return DEAL["rehab_estimate"]["2010_plus"]
+
+
+def calculate_mao(arv: int, rehab: int) -> int:
+    """Maximum Allowable Offer using the 70% rule."""
+    return round(arv * DEAL["arv_rule_pct"] - rehab)
+
+
+def calculate_profit(purchase: int, arv: int, rehab: int) -> dict:
+    """
+    Full deal P&L:
+      Net Profit = ARV − Purchase − Rehab − Buy Closing − Sell Closing − Hold Costs
+    """
+    buy_closing  = round(purchase * DEAL["buy_closing_pct"])
+    sell_closing = round(arv * DEAL["sell_closing_pct"])
+    hold         = DEAL["hold_costs"]
+    total_cost   = purchase + rehab + buy_closing + sell_closing + hold
+    net_profit   = arv - total_cost
+    roi          = net_profit / total_cost if total_cost > 0 else 0
+    return {
+        "purchase":     purchase,
+        "rehab":        rehab,
+        "buy_closing":  buy_closing,
+        "sell_closing": sell_closing,
+        "hold_costs":   hold,
+        "total_cost":   total_cost,
+        "net_profit":   net_profit,
+        "roi_pct":      round(roi * 100, 1),
+    }
+
+
+def grade_deal(net_profit: int) -> str:
+    """Assign A/B/C/D grade based on projected profit."""
+    if net_profit >= DEAL["grade_a_profit"]:
+        return "A"
+    elif net_profit >= DEAL["grade_b_profit"]:
+        return "B"
+    elif net_profit >= DEAL["grade_c_profit"]:
+        return "C"
+    else:
+        return "D"
+
+
+def score_property(prop: dict) -> dict:
+    """
+    Full scoring pipeline for a single property dict.
+
+    Expected prop keys:
+        address, city, state, zip_code, price (list price),
+        bedrooms, bathrooms, square_footage, year_built,
+        days_on_market, source (rentcast | paslc), listing_url
+    """
+    price   = prop.get("price", 0)
+    sqft    = prop.get("square_footage", 0)
+    yr_blt  = prop.get("year_built", 0)
+
+    arv_est  = estimate_arv(sqft)
+    arv_cons = arv_est["conservative"]
+    arv_opt  = arv_est["optimistic"]
+    rehab    = estimate_rehab(yr_blt)
+    mao      = calculate_mao(arv_cons, rehab)
+    pl       = calculate_profit(price, arv_cons, rehab)
+    grade    = grade_deal(pl["net_profit"])
+
+    return {
+        **prop,
+        "arv_conservative": arv_cons,
+        "arv_optimistic":   arv_opt,
+        "rehab_estimate":   rehab,
+        "mao":              mao,
+        "at_or_below_mao":  price <= mao,
+        **pl,
+        "grade":            grade,
+        "alert_now":        grade in ("A", "B"),
+    }
+
+
+def filter_and_score(properties: list) -> list:
+    """Score all properties, discard D-grades, sort by net profit descending."""
+    scored = [score_property(p) for p in properties]
+    viable = [p for p in scored if p["grade"] != "D"]
+    return sorted(viable, key=lambda x: x["net_profit"], reverse=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# email_sender.py  —  SendGrid HTML email delivery
+#
+# Sign up free at: https://sendgrid.com  (100 emails/day free forever)
+# After signup:
+#   1. Settings → API Keys → Create API Key (Full Access)
+#   2. Settings → Sender Authentication → verify your sender email
+#   3. Add SENDGRID_API_KEY to GitHub Secrets
+# ─────────────────────────────────────────────────────────────────────────────
+import os
+import logging
+from datetime import date
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Content
+from config import EMAIL
+
+logger = logging.getLogger(__name__)
+
+# ── GRADE STYLING ──────────────────────────────────────────────────────────────
+GRADE_STYLE = {
+    "A": {"bg": "#E8F5E9", "border": "#2E7D32", "badge_bg": "#2E7D32", "label": "A-GRADE DEAL"},
+    "B": {"bg": "#E3F2FD", "border": "#1565C0", "badge_bg": "#1565C0", "label": "B-GRADE DEAL"},
+    "C": {"bg": "#FFF8E1", "border": "#E65100", "badge_bg": "#E65100", "label": "C-GRADE DEAL"},
+}
+
+
+def _fmt_money(n: int) -> str:
+    return f"${n:,}"
+
+
+def _profit_color(profit: int) -> str:
+    if profit >= 40_000: return "#2E7D32"
+    if profit >= 25_000: return "#1565C0"
+    if profit >= 10_000: return "#E65100"
+    return "#C62828"
+
+
+def _property_card(prop: dict, index: int) -> str:
+    """Render a single property as an HTML card block."""
+    grade = prop.get("grade", "C")
+    gs    = GRADE_STYLE.get(grade, GRADE_STYLE["C"])
+    src   = prop.get("source", "")
+    is_off = (src == "paslc")
+
+    # Header flags
+    flags = []
+    if prop.get("absentee_owner"):
+        flags.append('<span style="background:#6A1B9A;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700;margin-right:4px;">ABSENTEE OWNER</span>')
+    if prop.get("at_or_below_mao"):
+        flags.append('<span style="background:#2E7D32;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700;margin-right:4px;">AT/BELOW MAO ✓</span>')
+    if prop.get("pool"):
+        flags.append('<span style="background:#0277BD;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700;">HAS POOL</span>')
+
+    flag_html = " ".join(flags)
+
+    dom_str   = f'{prop.get("days_on_market", 0)} DOM' if not is_off else "Off-Market"
+    yr        = prop.get("year_built", 0)
+    yr_str    = str(yr) if yr else "Unknown"
+
+    stories_raw = prop.get("stories")
+    stories_str = f"{int(stories_raw)}-story" if stories_raw else "1-story (assumed)"
+
+    link_url  = prop.get("listing_url", "")
+    link_html = (f'<a href="{link_url}" style="color:#1565C0;font-size:12px;">View Listing →</a>'
+                 if link_url else "")
+    if is_off and prop.get("parcel"):
+        link_html += (f' &nbsp;|&nbsp; <a href="{PASLC_URL}/{prop["parcel"]}" '
+                      f'style="color:#6A1B9A;font-size:12px;">PASLC Record →</a>')
+
+    return f"""
+    <div style="border:2px solid {gs['border']};border-radius:8px;margin-bottom:16px;
+                background:{gs['bg']};overflow:hidden;">
+      <!-- Card Header -->
+      <div style="background:{gs['badge_bg']};padding:8px 14px;display:flex;
+                  justify-content:space-between;align-items:center;">
+        <span style="color:#fff;font-weight:700;font-size:13px;">
+          #{index} — {gs['label']}
+        </span>
+        <span style="color:#fff;font-size:12px;opacity:0.9;">
+          {'🔑 OFF-MARKET' if is_off else '🏠 ON-MARKET'}
+        </span>
+      </div>
+      <!-- Address + Flags -->
+      <div style="padding:12px 14px 4px;">
+        <div style="font-size:16px;font-weight:700;color:#1B2A4A;margin-bottom:4px;">
+          {prop.get('address','N/A')}
+        </div>
+        <div style="font-size:13px;color:#555;margin-bottom:8px;">
+          {prop.get('city','')}, {prop.get('state','FL')}  &nbsp;|&nbsp;  {dom_str}
+        </div>
+        <div style="margin-bottom:8px;">{flag_html}</div>
+      </div>
+      <!-- Stats Grid -->
+      <div style="padding:4px 14px 12px;display:flex;flex-wrap:wrap;gap:8px;">
+
+        <!-- Left column: property facts -->
+        <div style="flex:1;min-width:180px;background:#fff;border-radius:6px;padding:10px 12px;">
+          <div style="font-size:11px;color:#888;font-weight:700;margin-bottom:6px;
+                      text-transform:uppercase;letter-spacing:0.5px;">Property</div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <tr><td style="color:#555;padding:2px 0;">List Price</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">{_fmt_money(prop.get('price',0))}</td></tr>
+            <tr><td style="color:#555;padding:2px 0;">Beds / Baths</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">
+                  {prop.get('bedrooms',0)} bed / {prop.get('bathrooms',0)} bath</td></tr>
+            <tr><td style="color:#555;padding:2px 0;">Size</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">
+                  {prop.get('square_footage',0):,} SF</td></tr>
+            <tr><td style="color:#555;padding:2px 0;">Year Built</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">{yr_str}</td></tr>
+            <tr><td style="color:#555;padding:2px 0;">Stories</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">{stories_str}</td></tr>
+          </table>
+        </div>
+
+        <!-- Middle column: deal math -->
+        <div style="flex:1;min-width:180px;background:#fff;border-radius:6px;padding:10px 12px;">
+          <div style="font-size:11px;color:#888;font-weight:700;margin-bottom:6px;
+                      text-transform:uppercase;letter-spacing:0.5px;">Deal Math (70% Rule)</div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <tr><td style="color:#555;padding:2px 0;">Est. ARV</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">
+                  {_fmt_money(prop.get('arv_conservative',0))}–{_fmt_money(prop.get('arv_optimistic',0))}</td></tr>
+            <tr><td style="color:#555;padding:2px 0;">Est. Rehab</td>
+                <td style="font-weight:700;color:#E65100;text-align:right;">
+                  {_fmt_money(prop.get('rehab_estimate',0))}</td></tr>
+            <tr><td style="color:#555;padding:2px 0;">Your MAO</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">
+                  {_fmt_money(prop.get('mao',0))}</td></tr>
+            <tr><td style="color:#555;padding:2px 0;">All-In Cost</td>
+                <td style="font-weight:700;color:#1B2A4A;text-align:right;">
+                  {_fmt_money(prop.get('total_cost',0))}</td></tr>
+          </table>
+        </div>
+
+        <!-- Right column: profit -->
+        <div style="flex:1;min-width:150px;background:{gs['bg']};border:1.5px solid {gs['border']};
+                    border-radius:6px;padding:10px 12px;text-align:center;">
+          <div style="font-size:11px;color:#888;font-weight:700;margin-bottom:4px;
+                      text-transform:uppercase;letter-spacing:0.5px;">Est. Net Profit</div>
+          <div style="font-size:28px;font-weight:700;color:{_profit_color(prop.get('net_profit',0))};">
+            {_fmt_money(prop.get('net_profit',0))}
+          </div>
+          <div style="font-size:13px;color:#555;margin-top:4px;">
+            ROI: <strong>{prop.get('roi_pct',0)}%</strong>
+          </div>
+          <div style="margin-top:8px;">{link_html}</div>
+        </div>
+
+      </div>
+    </div>"""
+
+
+def _build_html_body(on_market: list, off_market: list) -> str:
+    today = date.today().strftime("%B %d, %Y")
+    a_count = sum(1 for p in on_market + off_market if p.get("grade") == "A")
+
+    cards_on  = "".join(_property_card(p, i+1) for i, p in enumerate(on_market))
+    cards_off = "".join(_property_card(p, i+1) for i, p in enumerate(off_market))
+
+    on_section = f"""
+    <h2 style="color:#1B2A4A;font-size:16px;margin:24px 0 8px;border-bottom:2px solid #C9A84C;
+               padding-bottom:4px;">🏠 ON-MARKET DEALS ({len(on_market)} found)</h2>
+    {cards_on if cards_on else '<p style="color:#888;font-style:italic;">No qualifying on-market listings found today.</p>'}
+    """ if on_market is not None else ""
+
+    off_section = f"""
+    <h2 style="color:#1B2A4A;font-size:16px;margin:24px 0 8px;border-bottom:2px solid #6A1B9A;
+               padding-bottom:4px;">🔑 OFF-MARKET LEADS ({len(off_market)} found)</h2>
+    {cards_off if cards_off else '<p style="color:#888;font-style:italic;">No qualifying off-market leads found today.</p>'}
+    """ if off_market is not None else ""
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif;max-width:760px;margin:0 auto;padding:0;background:#f5f5f5;">
+
+  <!-- HEADER -->
+  <div style="background:#1B2A4A;padding:20px 24px;border-radius:8px 8px 0 0;">
+    <div style="color:#C9A84C;font-size:20px;font-weight:700;margin-bottom:4px;">
+      Fix &amp; Flip Deal Agent
+    </div>
+    <div style="color:#fff;font-size:14px;">St. Lucie County, FL &nbsp;|&nbsp; {today}</div>
+    {f'<div style="background:#2E7D32;color:#fff;display:inline-block;padding:4px 12px;border-radius:4px;font-size:12px;font-weight:700;margin-top:8px;">⭐ {a_count} A-GRADE DEAL{"S" if a_count!=1 else ""} TODAY</div>' if a_count > 0 else ''}
+  </div>
+
+  <!-- CRITERIA REMINDER -->
+  <div style="background:#fff;padding:12px 24px;border-bottom:1px solid #e0e0e0;">
+    <span style="font-size:12px;color:#555;">
+      <strong>Search criteria:</strong> &nbsp;
+      $190K–$250K &nbsp;|&nbsp; 3+ bed / 2+ bath &nbsp;|&nbsp; 1,540+ SF &nbsp;|&nbsp;
+      1-story SFR &nbsp;|&nbsp; St. Lucie County, FL
+    </span>
+  </div>
+
+  <!-- BODY -->
+  <div style="background:#f5f5f5;padding:16px 16px;">
+    {on_section}
+    {off_section}
+  </div>
+
+  <!-- FOOTER -->
+  <div style="background:#1B2A4A;padding:14px 24px;border-radius:0 0 8px 8px;text-align:center;">
+    <p style="color:#aaa;font-size:11px;margin:0;">
+      Jose Santiago · Licensed Florida Real Estate Agent · jsantiagorealtor@gmail.com<br>
+      ARV and profit estimates are automated projections — always verify with GC bids and pulled comps before committing.<br>
+      <a href="mailto:josesantiago105@gmail.com?subject=Unsubscribe Fix Flip Agent"
+         style="color:#C9A84C;font-size:10px;">Unsubscribe</a>
+      &nbsp;|&nbsp; <a href="mailto:jsantiagorealtor@gmail.com"
+         style="color:#C9A84C;font-size:10px;">jsantiagorealtor@gmail.com</a>
+    </p>
+  </div>
+
+</body></html>"""
+
+
+def send_deal_report(on_market: list, off_market: list) -> bool:
+    """
+    Send the HTML deal report via SendGrid.
+    Returns True on success, False on failure.
+    """
+    api_key = os.environ.get("SENDGRID_API_KEY", "")
+    if not api_key:
+        raise EnvironmentError("SENDGRID_API_KEY secret is not set.")
+
+    total = len(on_market) + len(off_market)
+    if total == 0:
+        logger.info("No qualifying deals found — skipping email.")
+        return True
+
+    html_body = _build_html_body(on_market, off_market)
+
+    a_count = sum(1 for p in on_market + off_market if p.get("grade") == "A")
+    subject = EMAIL["subject_both"]
+    if a_count > 0:
+        subject = f"⭐ {a_count} A-GRADE DEAL{'S' if a_count>1 else ''} — " + subject
+
+    message = Mail(
+        from_email  = (EMAIL["sender"], EMAIL["sender_name"]),
+        to_emails   = EMAIL["recipient"],
+        subject     = subject,
+        html_content= Content("text/html", html_body),
+    )
+
+    try:
+        sg   = SendGridAPIClient(api_key)
+        resp = sg.send(message)
+        logger.info(f"Email sent. Status: {resp.status_code} | "
+                    f"On-market: {len(on_market)} | Off-market: {len(off_market)}")
+        return True
+    except Exception as e:
+        logger.error(f"SendGrid error: {e}")
+        return False
+
+
+# PASLC base URL for record links in email
+PASLC_URL = "https://www.paslc.gov/RESearch.aspx?parcel="
+
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+# main.py  —  Fix & Flip Agent Orchestrator
+#
+# Run manually:   python main.py
+# Run on-market only:   python main.py --on-market-only
+# Run off-market only:  python main.py --off-market-only
+# Dry run (no email):   python main.py --dry-run
+#
+# Scheduled automatically via GitHub Actions (.github/workflows/daily_search.yml)
+# ─────────────────────────────────────────────────────────────────────────────
+import os
+import sys
+import logging
+import argparse
+from datetime import datetime
+
+from rentcast_agent  import fetch_on_market_listings
+from paslc_scraper   import fetch_off_market_leads
+from deal_scorer     import filter_and_score
+from email_sender    import send_deal_report
+
+# ── LOGGING ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level   = logging.INFO,
+    format  = "%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    datefmt = "%Y-%m-%d %H:%M:%S",
+    handlers= [logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("main")
+
+
+def run(on_market: bool = True, off_market: bool = True, dry_run: bool = False):
+    start = datetime.now()
+    logger.info("=" * 60)
+    logger.info("  FIX & FLIP AGENT  —  St. Lucie County, FL")
+    logger.info(f"  Started: {start.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 60)
+
+    # ── Step 1: Fetch On-Market via Rentcast ──────────────────────────────────
+    on_market_raw    = []
+    on_market_scored = []
+
+    if on_market:
+        logger.info("\n▶ Step 1: Fetching on-market listings (Rentcast)...")
+        try:
+            on_market_raw    = fetch_on_market_listings()
+            on_market_scored = filter_and_score(on_market_raw)
+            logger.info(f"  On-market: {len(on_market_raw)} fetched → "
+                        f"{len(on_market_scored)} A/B/C deals")
+        except Exception as e:
+            logger.error(f"  On-market fetch failed: {e}")
+
+    # ── Step 2: Scrape Off-Market from PASLC ──────────────────────────────────
+    off_market_raw    = []
+    off_market_scored = []
+
+    if off_market:
+        logger.info("\n▶ Step 2: Scraping off-market leads (PASLC)...")
+        try:
+            off_market_raw    = fetch_off_market_leads()
+            off_market_scored = filter_and_score(off_market_raw)
+            logger.info(f"  Off-market: {len(off_market_raw)} scraped → "
+                        f"{len(off_market_scored)} A/B/C deals")
+        except Exception as e:
+            logger.error(f"  Off-market scrape failed: {e}")
+
+    # ── Step 3: Summary ───────────────────────────────────────────────────────
+    all_deals = on_market_scored + off_market_scored
+    a_deals   = [d for d in all_deals if d["grade"] == "A"]
+    b_deals   = [d for d in all_deals if d["grade"] == "B"]
+    c_deals   = [d for d in all_deals if d["grade"] == "C"]
+
+    logger.info(f"\n── Deal Summary ─────────────────────────────────────")
+    logger.info(f"  A-grade (profit ≥ $40K):  {len(a_deals)}")
+    logger.info(f"  B-grade (profit ≥ $25K):  {len(b_deals)}")
+    logger.info(f"  C-grade (profit ≥ $10K):  {len(c_deals)}")
+    logger.info(f"  Total qualifying deals:   {len(all_deals)}")
+
+    if a_deals:
+        logger.info("\n  ⭐ A-GRADE DEALS:")
+        for d in a_deals:
+            logger.info(f"    {d['address']} | ${d['price']:,} list | "
+                        f"ARV ~${d['arv_conservative']:,} | Profit ~${d['net_profit']:,}")
+
+    # ── Step 4: Send Email ────────────────────────────────────────────────────
+    if dry_run:
+        logger.info("\n▶ DRY RUN — Email not sent. Here's what would be sent:")
+        for d in (on_market_scored + off_market_scored)[:3]:
+            logger.info(f"  [{d['grade']}] {d['address']} | "
+                        f"${d['price']:,} → profit ~${d['net_profit']:,} | {d['source']}")
+    else:
+        if all_deals:
+            logger.info("\n▶ Step 3: Sending email report...")
+            success = send_deal_report(on_market_scored, off_market_scored)
+            if success:
+                logger.info("  Email sent successfully ✓")
+            else:
+                logger.error("  Email failed — check SENDGRID_API_KEY")
+                sys.exit(1)
+        else:
+            logger.info("\n  No qualifying deals found today — no email sent.")
+
+    elapsed = (datetime.now() - start).seconds
+    logger.info(f"\n✓ Agent finished in {elapsed}s")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fix & Flip Property AI Agent")
+    parser.add_argument("--on-market-only",  action="store_true",
+                        help="Only run Rentcast on-market search")
+    parser.add_argument("--off-market-only", action="store_true",
+                        help="Only run PASLC off-market scraper")
+    parser.add_argument("--dry-run",         action="store_true",
+                        help="Run everything but don't send the email")
+    args = parser.parse_args()
+
+    run(
+        on_market  = not args.off_market_only,
+        off_market = not args.on_market_only,
+        dry_run    = args.dry_run,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# paslc_scraper.py  —  Off-market leads from St. Lucie County Property Appraiser
+#                      Source: https://www.paslc.gov  (public records, free)
+#
+# Strategy: Search the public property database, filter to single-family homes
+# matching our size/price criteria, then flag ABSENTEE OWNERS (owner mailing
+# address ≠ property address) as motivated-seller candidates.
+#
+# HOW IT WORKS:
+#   1. POST a search form to paslc.gov with section/subdivision filters
+#   2. Parse the HTML results table row by row
+#   3. Compare property_address vs mailing_address → absentee = True/False
+#   4. Filter by SF, year built, property type
+#   5. Return leads list to main.py → deal_scorer → email
+#
+# NOTE: Web scraping targets publicly accessible government data.
+# If paslc.gov changes their HTML structure, update the CSS selectors
+# in the SELECTORS dict below. Run `python paslc_scraper.py --debug`
+# to print raw HTML and re-map selectors.
+# ─────────────────────────────────────────────────────────────────────────────
+import re
+import time
+import logging
+import argparse
+import requests
+from bs4 import BeautifulSoup
+from config import SEARCH, PASLC, DEAL
+
+logger = logging.getLogger(__name__)
+
+# ── CSS / HTML SELECTORS ──────────────────────────────────────────────────────
+# Adjust these if paslc.gov updates their site layout.
+SELECTORS = {
+    "results_table":    "table.result-table, table#resultsTable, table.searchResults",
+    "result_row":       "tr",
+    # Column indices in the results table (0-based). Verify by running --debug.
+    "col_parcel":       0,
+    "col_owner":        1,
+    "col_prop_addr":    2,
+    "col_mail_addr":    3,
+    "col_land_use":     4,
+    "col_sqft":         5,
+    "col_year_built":   6,
+    "col_assessed_val": 7,
+    # Detail page link (parcel number usually links to full record)
+    "detail_link":      "a",
+}
+
+# Alternative: many FL county PAs use qPublic or similar — try this URL pattern
+QPUBLIC_SEARCH_URL = "https://qpublic.schneidercorp.com/Application.aspx?AppID=1032&LayerID=22628&PageTypeID=2&PageID=9404"
+
+SESSION_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Connection":      "keep-alive",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASLC SESSION + SEARCH
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _start_session() -> requests.Session:
+    """Create a session and load the search page to get any required cookies."""
+    session = requests.Session()
+    session.headers.update(SESSION_HEADERS)
+    try:
+        search_url = PASLC["base_url"] + PASLC["search_path"]
+        resp = session.get(search_url, timeout=20)
+        resp.raise_for_status()
+        logger.debug(f"PASLC session started. Status: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Could not reach paslc.gov search page: {e}")
+    return session
+
+
+def _get_viewstate(html: str) -> dict:
+    """Extract ASP.NET hidden form fields (ViewState, EventValidation) if present."""
+    soup = BeautifulSoup(html, "html.parser")
+    fields = {}
+    for hidden in soup.find_all("input", {"type": "hidden"}):
+        name = hidden.get("name", "")
+        val  = hidden.get("value", "")
+        if name:
+            fields[name] = val
+    return fields
+
+
+def _search_section(session: requests.Session, section: str) -> list:
+    """
+    POST a search for one PSL subdivision/section and return parsed rows.
+    Returns list of raw dicts; filtering happens in _parse_results().
+    """
+    search_url = PASLC["base_url"] + PASLC["search_path"]
+
+    try:
+        # Step 1: GET the search form to retrieve hidden ASP.NET fields
+        get_resp = session.get(search_url, timeout=20)
+        hidden   = _get_viewstate(get_resp.text)
+
+        # Step 2: POST the search form
+        # These field names are typical for FL county PA ASP.NET CAMA systems.
+        # Adjust if paslc.gov uses different field names (check browser DevTools).
+        post_data = {
+            **hidden,
+            "ctl00$cphMain$txtSubdivision":    section,
+            "ctl00$cphMain$txtOwnerName":      "",
+            "ctl00$cphMain$txtParcelNum":      "",
+            "ctl00$cphMain$txtSiteAddress":    "",
+            "ctl00$cphMain$txtCity":           "",
+            "ctl00$cphMain$btnSearch":         "Search",
+        }
+
+        post_resp = session.post(search_url, data=post_data, timeout=30)
+        post_resp.raise_for_status()
+        return _parse_results(post_resp.text, section)
+
+    except requests.HTTPError as e:
+        logger.error(f"PASLC HTTP error for section '{section}': {e}")
+        return []
+    except Exception as e:
+        logger.error(f"PASLC unexpected error for '{section}': {e}")
+        return []
+
+
+def _parse_results(html: str, section: str) -> list:
+    """
+    Parse the HTML results table and extract property data rows.
+    Returns list of raw property dicts (not yet filtered for investment criteria).
+    """
+    soup   = BeautifulSoup(html, "html.parser")
+    table  = soup.select_one(SELECTORS["results_table"])
+
+    if not table:
+        # Try fallback — some pages embed data in any table after page load
+        tables = soup.find_all("table")
+        # Heuristic: find table with most rows (likely the results table)
+        table = max(tables, key=lambda t: len(t.find_all("tr")), default=None) if tables else None
+
+    if not table:
+        logger.warning(f"No results table found for section: {section}")
+        return []
+
+    rows    = table.find_all(SELECTORS["result_row"])
+    results = []
+
+    for row in rows[1:]:  # skip header row
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 6:
+            continue
+
+        def cell_text(idx):
+            return cells[idx].get_text(strip=True) if idx < len(cells) else ""
+
+        # Extract detail URL (usually the parcel number column links to full record)
+        parcel_cell = cells[SELECTORS["col_parcel"]]
+        detail_link = parcel_cell.find("a")
+        detail_url  = ""
+        if detail_link and detail_link.get("href"):
+            href = detail_link["href"]
+            detail_url = href if href.startswith("http") else PASLC["base_url"] + "/" + href.lstrip("/")
+
+        parcel      = cell_text(SELECTORS["col_parcel"]).strip()
+        owner       = cell_text(SELECTORS["col_owner"]).strip()
+        prop_addr   = cell_text(SELECTORS["col_prop_addr"]).strip()
+        mail_addr   = cell_text(SELECTORS["col_mail_addr"]).strip()
+        land_use    = cell_text(SELECTORS["col_land_use"]).strip()
+        sqft_raw    = cell_text(SELECTORS["col_sqft"]).replace(",", "").strip()
+        yr_raw      = cell_text(SELECTORS["col_year_built"]).strip()
+        assessed_v  = cell_text(SELECTORS["col_assessed_val"]).replace(",", "").replace("$", "").strip()
+
+        sqft       = int(sqft_raw)    if sqft_raw.isdigit()    else 0
+        year_built = int(yr_raw)      if yr_raw.isdigit()      else 0
+        assessed   = int(assessed_v)  if assessed_v.isdigit()  else 0
+
+        if not parcel:
+            continue
+
+        results.append({
+            "parcel":       parcel,
+            "owner":        owner,
+            "prop_address": prop_addr,
+            "mail_address": mail_addr,
+            "land_use":     land_use,
+            "square_footage": sqft,
+            "year_built":   year_built,
+            "assessed_value": assessed,
+            "section":      section,
+            "detail_url":   detail_url,
+        })
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILTERING + NORMALIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_absentee_owner(prop_addr: str, mail_addr: str) -> bool:
+    """
+    Detect absentee ownership by comparing property and mailing addresses.
+    Simple but effective: if the first 10 chars differ, it's likely absentee.
+    """
+    if not prop_addr or not mail_addr:
+        return False
+    # Normalize: lowercase, remove punctuation
+    clean = lambda s: re.sub(r"[^a-z0-9 ]", "", s.lower().strip())
+    p = clean(prop_addr)[:30]
+    m = clean(mail_addr)[:30]
+    return p != m
+
+
+def _is_single_family(land_use_code: str) -> bool:
+    """Check if land use code indicates single-family residential."""
+    code = land_use_code.upper().strip()
+    sfr_codes = [c.upper() for c in PASLC["sfr_land_use_codes"]]
+    # Also accept codes that start with "01" (common FL SFR convention)
+    return any(code.startswith(c) or code == c for c in sfr_codes) or code.startswith("01")
+
+
+def _normalize_off_market(raw: dict) -> dict:
+    """Convert PASLC raw record → unified property dict for deal_scorer."""
+    addr = raw["prop_address"]
+    # Try to extract city from mailing address or default to PSL
+    city = "Port St. Lucie"
+    for c in ["FORT PIERCE", "PORT ST LUCIE", "PORT SAINT LUCIE"]:
+        if c in addr.upper() or c in raw.get("mail_address", "").upper():
+            city = c.title().replace("Saint", "St.")
+            break
+
+    return {
+        "address":        addr,
+        "city":           city,
+        "state":          "FL",
+        "zip_code":       "",           # Not always available in summary view
+        "bedrooms":       3,            # Assumed for SFR in our SF range; verify on detail page
+        "bathrooms":      2,            # Same assumption
+        "square_footage": raw["square_footage"],
+        "year_built":     raw["year_built"],
+        "stories":        1,            # PSL CBS SFR are predominantly 1-story
+        "property_type":  "Single Family",
+        "pool":           False,        # Unknown from summary
+        # Use assessed value × 1.15 as rough market-value proxy (FL assessment ratio)
+        "price":          round(raw["assessed_value"] * 1.15) if raw["assessed_value"] > 0 else 0,
+        "days_on_market": 0,            # Off-market, not listed
+        "listing_status": "Off-Market",
+        "listing_url":    raw.get("detail_url", PASLC["base_url"]),
+        # Off-market metadata
+        "source":         "paslc",
+        "source_id":      raw["parcel"],
+        "owner":          raw["owner"],
+        "absentee_owner": raw.get("absentee", False),
+        "assessed_value": raw["assessed_value"],
+        "section":        raw["section"],
+        "parcel":         raw["parcel"],
+    }
+
+
+def _passes_off_market_filters(raw: dict) -> bool:
+    """Apply investment-criteria filters to raw PASLC records."""
+    # Must be single-family residential
+    if not _is_single_family(raw.get("land_use", "")):
+        return False
+    # Minimum square footage
+    if raw["square_footage"] < SEARCH["min_sqft"]:
+        return False
+    # Skip properties with no size data (data missing)
+    if raw["square_footage"] == 0:
+        return False
+    # Skip brand-new construction (assessed value too high, no distress)
+    if raw["year_built"] > 2020:
+        return False
+    # Assessed value proxy must be in rough price range
+    # Assessed value is typically 80-90% of market in FL
+    if raw["assessed_value"] > 0:
+        est_market = raw["assessed_value"] * 1.15
+        if est_market > SEARCH["max_price"] * 1.3:  # Allow 30% above max (may negotiate)
+            return False
+        if est_market < SEARCH["min_price"] * 0.6:  # Too cheap — likely teardown
+            return False
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_off_market_leads() -> list:
+    """
+    Scrape St. Lucie County PA for off-market leads.
+    Returns list of scored-ready property dicts.
+    """
+    session  = _start_session()
+    raw_all  = []
+    seen_parcels = set()
+
+    for section in PASLC["target_sections"]:
+        logger.info(f"PASLC scrape → {section}")
+        rows = _search_section(session, section)
+
+        for row in rows:
+            parcel = row.get("parcel", "")
+            if parcel in seen_parcels:
+                continue
+            seen_parcels.add(parcel)
+
+            # Tag absentee owners
+            row["absentee"] = _is_absentee_owner(row["prop_address"], row["mail_address"])
+
+            if _passes_off_market_filters(row):
+                raw_all.append(row)
+
+        logger.info(f"  {section}: {len(rows)} scraped → {sum(1 for r in raw_all if r['section']==section)} passed filters")
+        time.sleep(PASLC["rate_limit_secs"])  # Be respectful — public server
+
+        if len(raw_all) >= PASLC["max_results"]:
+            logger.info("Max off-market results reached. Stopping early.")
+            break
+
+    # Normalize
+    normalized = [_normalize_off_market(r) for r in raw_all]
+
+    # Prioritize: absentee owners first, then by SF (bigger homes = more value)
+    absentee = [p for p in normalized if p["absentee_owner"]]
+    resident = [p for p in normalized if not p["absentee_owner"]]
+    absentee.sort(key=lambda x: x["square_footage"], reverse=True)
+    resident.sort(key=lambda x: x["square_footage"], reverse=True)
+
+    result = absentee + resident
+    logger.info(f"Off-market total: {len(result)} leads ({len(absentee)} absentee owners)")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG MODE  —  run: python paslc_scraper.py --debug
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true",
+                        help="Print raw HTML of first section search to debug selectors")
+    args = parser.parse_args()
+
+    if args.debug:
+        print("\n── DEBUG MODE ── Fetching raw HTML from PASLC...\n")
+        session = _start_session()
+        section = PASLC["target_sections"][0]
+
+        search_url = PASLC["base_url"] + PASLC["search_path"]
+        get_resp   = session.get(search_url, timeout=20)
+        hidden     = _get_viewstate(get_resp.text)
+
+        post_data  = {
+            **hidden,
+            "ctl00$cphMain$txtSubdivision": section,
+            "ctl00$cphMain$btnSearch":      "Search",
+        }
+        post_resp = session.post(search_url, data=post_data, timeout=30)
+        soup      = BeautifulSoup(post_resp.text, "html.parser")
+
+        print(f"Page title: {soup.title.string if soup.title else 'N/A'}")
+        print(f"\nAll tables found: {len(soup.find_all('table'))}")
+        for i, t in enumerate(soup.find_all("table")):
+            rows = t.find_all("tr")
+            print(f"  Table {i}: {len(rows)} rows, classes={t.get('class','')}, id={t.get('id','')}")
+        print("\n── First 3000 chars of body ──")
+        print(post_resp.text[:3000])
+    else:
+        leads = fetch_off_market_leads()
+        print(f"\nFound {len(leads)} off-market leads:")
+        for lead in leads[:5]:
+            print(f"  {lead['address']} | {lead['square_footage']} SF | "
+                  f"{'ABSENTEE' if lead['absentee_owner'] else 'owner-occ'} | "
+                  f"Est. price ~${lead['price']:,}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# rentcast_agent.py  —  On-market search via Rentcast API (free tier)
+#
+# Free tier: 50 calls/month
+# This script uses 2 calls per run (one per city).
+# Running every other day = ~30 calls/month — safely within free tier.
+# For true daily alerts upgrade to Rentcast Starter ($29/mo = 1,000 calls).
+#
+# Sign up: https://app.rentcast.io/app/api-access
+# ─────────────────────────────────────────────────────────────────────────────
+import os
+import time
+import logging
+import requests
+from config import SEARCH, RENTCAST
+
+logger = logging.getLogger(__name__)
+
+
+def _get_headers() -> dict:
+    api_key = os.environ.get("RENTCAST_API_KEY", "")
+    if not api_key:
+        raise EnvironmentError("RENTCAST_API_KEY secret is not set.")
+    return {"X-Api-Key": api_key, "Accept": "application/json"}
+
+
+def _normalize_listing(raw: dict, city: str) -> dict:
+    """Map Rentcast response fields → unified property dict used by deal_scorer."""
+    sqft = raw.get("squareFootage") or raw.get("livingArea") or 0
+    return {
+        # Location
+        "address":        raw.get("formattedAddress") or raw.get("address", ""),
+        "city":           raw.get("city", city),
+        "state":          raw.get("state", SEARCH["state"]),
+        "zip_code":       raw.get("zipCode", ""),
+        # Property details
+        "bedrooms":       raw.get("bedrooms", 0),
+        "bathrooms":      raw.get("bathrooms", 0),
+        "square_footage": int(sqft),
+        "year_built":     raw.get("yearBuilt", 0),
+        "stories":        raw.get("stories") or raw.get("numStories", None),
+        "property_type":  raw.get("propertyType", ""),
+        "pool":           raw.get("pool", False),
+        # Listing details
+        "price":          raw.get("price") or raw.get("listPrice", 0),
+        "days_on_market": raw.get("daysOnMarket", 0),
+        "listing_status": raw.get("status", "Active"),
+        "listing_url":    raw.get("listingUrl") or _build_zillow_url(raw),
+        # Meta
+        "source":         "rentcast",
+        "source_id":      raw.get("id", ""),
+    }
+
+
+def _build_zillow_url(raw: dict) -> str:
+    """Fallback: build a Zillow search URL from address if no direct link."""
+    addr = raw.get("formattedAddress") or raw.get("address", "")
+    if not addr:
+        return ""
+    slug = addr.replace(" ", "-").replace(",", "").replace(".", "")
+    return f"https://www.zillow.com/homes/{slug}_rb/"
+
+
+def _passes_filters(prop: dict) -> bool:
+    """Apply post-API filters that Rentcast can't handle server-side."""
+    # Square footage
+    if prop["square_footage"] < SEARCH["min_sqft"]:
+        return False
+    # Bedrooms / bathrooms
+    if prop["bedrooms"] < SEARCH["min_beds"]:
+        return False
+    if prop["bathrooms"] < SEARCH["min_baths"]:
+        return False
+    # Price range
+    if not (SEARCH["min_price"] <= prop["price"] <= SEARCH["max_price"]):
+        return False
+    # Stories — only filter if data is present (many listings omit this field)
+    stories = prop.get("stories")
+    if stories and stories > SEARCH["stories"]:
+        return False
+    # Days on market
+    if prop["days_on_market"] > SEARCH["max_dom"]:
+        return False
+    # Must be single-family residential
+    pt = (prop["property_type"] or "").lower()
+    if pt and "single" not in pt and "sfr" not in pt and "residential" not in pt:
+        return False
+    return True
+
+
+def search_city(city: str) -> list:
+    """
+    Call Rentcast /listings/sale for a single city.
+    Returns list of normalized, filtered property dicts.
+    """
+    url = f"{RENTCAST['base_url']}/listings/sale"
+    params = {
+        "city":            city,
+        "state":           SEARCH["state"],
+        "propertyType":    SEARCH["property_type"],
+        "bedrooms":        SEARCH["min_beds"],
+        "bathrooms":       SEARCH["min_baths"],
+        "minPrice":        SEARCH["min_price"],
+        "maxPrice":        SEARCH["max_price"],
+        "minSquareFootage": SEARCH["min_sqft"],
+        "status":          "Active",
+        "limit":           RENTCAST["limit"],
+    }
+
+    try:
+        logger.info(f"Rentcast search → {city}, {SEARCH['state']}")
+        resp = requests.get(url, headers=_get_headers(), params=params, timeout=30)
+        resp.raise_for_status()
+        raw_listings = resp.json()
+
+        if not isinstance(raw_listings, list):
+            # Some API versions wrap results: {"listings": [...]}
+            raw_listings = raw_listings.get("listings", [])
+
+        normalized = [_normalize_listing(r, city) for r in raw_listings]
+        filtered   = [p for p in normalized if _passes_filters(p)]
+
+        logger.info(f"  {city}: {len(raw_listings)} raw → {len(filtered)} after filters")
+        return filtered
+
+    except requests.HTTPError as e:
+        if e.response.status_code == 429:
+            logger.warning("Rentcast rate limit hit — free tier may be exhausted for this month.")
+        else:
+            logger.error(f"Rentcast HTTP error for {city}: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Rentcast unexpected error for {city}: {e}")
+        return []
+
+
+def fetch_on_market_listings() -> list:
+    """
+    Search all configured cities and return deduplicated results.
+    Adds a 1-second pause between calls to respect rate limits.
+    """
+    all_results = []
+    seen_ids    = set()
+
+    for i, city in enumerate(SEARCH["cities"]):
+        if i > 0:
+            time.sleep(1)  # Polite pause between API calls
+        listings = search_city(city)
+        for prop in listings:
+            # Deduplicate by source ID or address
+            key = prop.get("source_id") or prop.get("address")
+            if key and key not in seen_ids:
+                seen_ids.add(key)
+                all_results.append(prop)
+
+    logger.info(f"On-market total (deduplicated): {len(all_results)} properties")
+    return all_results
+
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+sendgrid==6.11.0
+python-dotenv==1.0.1
 
